@@ -4,6 +4,7 @@ from typing import Any, Dict, Iterable, Literal, Optional, List, Sequence, Tuple
 from urllib.parse import ParseResult, urlparse
 
 import clickhouse_connect
+import sqlglot
 
 from dlt.common.configuration.specs import (
     CredentialsConfiguration,
@@ -306,11 +307,88 @@ class ClickHouseMergeJob(SqlMergeFollowupJob):
 class LoadIdScopedClickHouseMergeJob(ClickHouseMergeJob):
     "Merge job that scopes every staging read to the current `_dlt_load_id`."
 
+    # A prune conjunct embeds at most this many literal partition values; a
+    # wider set adds statement bloat for little pruning gain.
+    PARTITION_PRUNE_MAX_VALUES = 25
+
     @classmethod
     def _load_id_predicate(cls, prefix: str = "") -> str:
         load_id = load_package_state()["load_id"]
         col = f"{prefix}`{C_DLT_LOAD_ID}`"
         return f"{col} = {escape_clickhouse_literal(load_id)}"
+
+    @classmethod
+    def _partition_columns(cls, table: PreparedTableSchema) -> List[str]:
+        """Column names the table's PARTITION BY key depends on."""
+        hint = table.get(PARTITION_HINT)
+        if isinstance(hint, str):
+            # SQL expression, e.g. "modulo(cityHash64(tenant_id), 40)"
+            try:
+                parsed = sqlglot.parse_one(hint, read="clickhouse")
+            except Exception:
+                return []
+            return sorted({column.name for column in parsed.find_all(sqlglot.exp.Column)})
+        if isinstance(hint, (list, tuple)):
+            return [str(column) for column in hint]
+        return get_columns_names_with_prop(table, "partition")
+
+    @staticmethod
+    def _prune_literal(value: Any) -> Optional[str]:
+        if isinstance(value, bool):
+            return "true" if value else "false"
+        if isinstance(value, (int, float)):
+            return str(value)
+        if isinstance(value, str):
+            return escape_clickhouse_literal(value)
+        # NULL or a type we can't render reliably: caller skips pruning
+        return None
+
+    @classmethod
+    def _partition_prune_predicate(
+        cls,
+        root_table: PreparedTableSchema,
+        staging_root_table_name: str,
+        sql_client: SqlClientBase[Any],
+    ) -> Tuple[str, List[str]]:
+        """Literal `(cols) IN (...)` over the partition-key columns of this load's staged rows.
+
+        A mutation like ``DELETE ... WHERE (keys) IN (SELECT ... FROM staging)`` cannot be
+        partition-pruned: ClickHouse rewrites every part because the subquery is opaque to
+        the partition-key analysis. One load's staged rows typically cover very few
+        partition values (a single tenant, one day, ...), so restating them as literals
+        lets the mutation skip every other partition. Returns ``("", [])`` when pruning is
+        impossible or not worthwhile; callers then emit the unpruned SQL as before.
+        """
+        columns = cls._partition_columns(root_table)
+        if not columns:
+            return "", []
+        escaped_columns = [sql_client.escape_column_name(column) for column in columns]
+        column_list = ", ".join(escaped_columns)
+        try:
+            rows = sql_client.execute_sql(
+                f"SELECT DISTINCT {column_list} FROM {staging_root_table_name}"
+                f" WHERE {cls._load_id_predicate()}"
+                f" LIMIT {cls.PARTITION_PRUNE_MAX_VALUES + 1}"
+            )
+        except Exception:
+            logger.warning(
+                "Could not read staged partition values from %s for merge partition"
+                " pruning; falling back to unpruned merge SQL.",
+                staging_root_table_name,
+            )
+            return "", []
+        if not rows or len(rows) > cls.PARTITION_PRUNE_MAX_VALUES:
+            return "", []
+        value_tuples = set()
+        for row in rows:
+            literals = [cls._prune_literal(value) for value in row]
+            if any(literal is None for literal in literals):
+                return "", []
+            value_tuples.add(
+                literals[0] if len(literals) == 1 else "(" + ", ".join(literals) + ")"
+            )
+        lhs = escaped_columns[0] if len(escaped_columns) == 1 else f"({column_list})"
+        return f"{lhs} IN ({', '.join(sorted(value_tuples))})", escaped_columns
 
     @classmethod
     def gen_key_table_clauses(
@@ -402,12 +480,32 @@ class LoadIdScopedClickHouseMergeJob(ClickHouseMergeJob):
         cls, table_chain: Sequence[PreparedTableSchema], sql_client: SqlClientBase[Any]
     ) -> List[str]:
         sql = super().gen_merge_sql(table_chain, sql_client)
+        root_table = table_chain[0]
         root_table_name, staging_root_table_name = sql_client.get_qualified_table_names(
-            table_chain[0]["name"]
+            root_table["name"]
         )
+        predicate = cls._load_id_predicate()
+        prune_predicate, prune_columns = cls._partition_prune_predicate(
+            root_table, staging_root_table_name, sql_client
+        )
+        # A prune conjunct on the root DELETE is only equivalent when the delete's key
+        # tuple contains every partition column: the IN subquery then already restricts
+        # those columns to staged values, so the conjunct changes nothing but lets the
+        # mutation skip all other partitions. With a partition column outside the keys,
+        # a staged row may legitimately target a dest row in another partition - skip.
+        prunable_delete_prefixes = []
+        if prune_predicate:
+            for key_set in ("primary_key", "merge_key"):
+                keys = cls._escape_list(
+                    get_columns_names_with_prop(root_table, key_set),
+                    sql_client.escape_column_name,
+                )
+                if keys and all(column in keys for column in prune_columns):
+                    prunable_delete_prefixes.append(
+                        f"DELETE FROM {root_table_name} WHERE ({', '.join(keys)}) IN"
+                    )
         # without primary keys the root insert bypasses gen_select_from_dedup_sql and would copy
         # the staged rows of every concurrent load, duplicating them in the destination
-        predicate = cls._load_id_predicate()
         staging_read = f" FROM {staging_root_table_name} WHERE "
         for i, stmt in enumerate(sql):
             if (
@@ -417,8 +515,15 @@ class LoadIdScopedClickHouseMergeJob(ClickHouseMergeJob):
             ):
                 head, _, condition = stmt.rpartition(staging_read)
                 sql[i] = f"{head}{staging_read}{cls._scope_condition(condition)}"
-        # drop only this load's rows from the shared staging table once merged
-        sql.append(f"DELETE FROM {staging_root_table_name} WHERE {predicate}")
+            elif any(stmt.startswith(prefix) for prefix in prunable_delete_prefixes):
+                sql[i] = f"{stmt} AND {prune_predicate}"
+        # drop only this load's rows from the shared staging table once merged; the prune
+        # conjunct is always equivalent here - by construction every staged row of this
+        # load carries one of the listed partition values
+        staging_delete = f"DELETE FROM {staging_root_table_name} WHERE {predicate}"
+        if prune_predicate:
+            staging_delete += f" AND {prune_predicate}"
+        sql.append(staging_delete)
         return sql
 
 

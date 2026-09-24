@@ -15,6 +15,7 @@ from dlt.destinations.impl.clickhouse.configuration import (
     ClickHouseClientConfiguration,
     ClickHouseCredentials,
 )
+from dlt.destinations.impl.clickhouse.typing import PARTITION_HINT
 from dlt.common.destination.typing import PreparedTableSchema
 from dlt.common.schema.utils import new_table, pipeline_state_table
 from tests.load.clickhouse.utils import clickhouse_client
@@ -417,3 +418,133 @@ def test_load_id_scoped_insert_temp_table_without_primary_key(
     assert insert_sql[0].endswith(
         f"WHERE (`deleted` IS NULL OR `deleted` = false) AND `_dlt_load_id` = '{scoped_load_id}'"
     )
+
+
+def _mock_staged_partition_values(
+    monkeypatch: pytest.MonkeyPatch, clickhouse_client: ClickHouseClient, rows: List[Tuple]
+) -> List[str]:
+    """Replace execute_sql and record the queries the merge job issues."""
+    executed: List[str] = []
+
+    def _execute(sql: str, *args, **kwargs):
+        executed.append(sql)
+        return rows
+
+    monkeypatch.setattr(clickhouse_client.sql_client, "execute_sql", _execute)
+    return executed
+
+
+def _statements(sql: List[str], prefix: str) -> List[str]:
+    return [stmt for stmt in sql if stmt.startswith(prefix)]
+
+
+def test_load_id_scoped_merge_prunes_deletes_by_partition_values(
+    clickhouse_client: ClickHouseClient,
+    scoped_load_id: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With PARTITION BY over a key column, both delete mutations gain a literal
+    IN conjunct so ClickHouse can prune to the staged partitions (dlt-hub#4297)."""
+    table = _prepare_merge_table(clickhouse_client, "pruned_table", merge_key=True)
+    table[PARTITION_HINT] = "modulo(cityHash64(col1), 40)"
+    executed = _mock_staged_partition_values(
+        monkeypatch, clickhouse_client, [(770,), (1650,)]
+    )
+
+    sql = LoadIdScopedClickHouseMergeJob.gen_merge_sql([table], clickhouse_client.sql_client)
+
+    root_table_name, staging_table_name = clickhouse_client.sql_client.get_qualified_table_names(
+        "pruned_table"
+    )
+    prune = "`col1` IN (1650, 770)"
+
+    # the staged values were read scoped to this load
+    assert any(f"`_dlt_load_id` = '{scoped_load_id}'" in stmt for stmt in executed)
+    (root_delete,) = _statements(sql, f"DELETE FROM {root_table_name} WHERE")
+    assert root_delete.endswith(f" AND {prune}")
+    (staging_delete,) = _statements(sql, f"DELETE FROM {staging_table_name} WHERE")
+    assert staging_delete.endswith(f"`_dlt_load_id` = '{scoped_load_id}' AND {prune}")
+
+
+def test_load_id_scoped_merge_prunes_string_partition_values(
+    clickhouse_client: ClickHouseClient,
+    scoped_load_id: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    table = _prepare_merge_table(clickhouse_client, "tenant_table", merge_key=True)
+    # TABLE_UPDATE col1 is bigint, but the literal path is type-driven
+    table[PARTITION_HINT] = "modulo(cityHash64(col1), 40)"
+    _mock_staged_partition_values(monkeypatch, clickhouse_client, [("a'770",)])
+
+    sql = LoadIdScopedClickHouseMergeJob.gen_merge_sql([table], clickhouse_client.sql_client)
+
+    root_table_name = clickhouse_client.sql_client.make_qualified_table_name("tenant_table")
+    (root_delete,) = _statements(sql, f"DELETE FROM {root_table_name} WHERE")
+    # escape_clickhouse_literal doubles embedded quotes
+    assert root_delete.endswith(" AND `col1` IN ('a''770')")
+
+
+def test_load_id_scoped_merge_skips_root_prune_when_partition_outside_keys(
+    clickhouse_client: ClickHouseClient,
+    scoped_load_id: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A partition column outside the delete's key tuple could exclude dest rows the
+    merge must delete - the root delete stays unpruned; the staging delete (which by
+    construction only targets this load's rows) is still pruned."""
+    table = _prepare_merge_table(clickhouse_client, "outside_keys_table", merge_key=True)
+    table[PARTITION_HINT] = "modulo(cityHash64(col2), 40)"
+    _mock_staged_partition_values(monkeypatch, clickhouse_client, [(1.5,)])
+
+    sql = LoadIdScopedClickHouseMergeJob.gen_merge_sql([table], clickhouse_client.sql_client)
+
+    root_table_name, staging_table_name = clickhouse_client.sql_client.get_qualified_table_names(
+        "outside_keys_table"
+    )
+    (root_delete,) = _statements(sql, f"DELETE FROM {root_table_name} WHERE")
+    assert "col2" not in root_delete
+    (staging_delete,) = _statements(sql, f"DELETE FROM {staging_table_name} WHERE")
+    assert staging_delete.endswith(" AND `col2` IN (1.5)")
+
+
+def test_load_id_scoped_merge_unpruned_when_staging_read_fails(
+    clickhouse_client: ClickHouseClient,
+    scoped_load_id: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """SQL generation must never fail because the staged-values probe does - the
+    merge falls back to the previous, unpruned statements."""
+    table = _prepare_merge_table(clickhouse_client, "probe_fails_table", merge_key=True)
+    table[PARTITION_HINT] = "modulo(cityHash64(col1), 40)"
+
+    def _raise(sql: str, *args, **kwargs):
+        raise RuntimeError("no connection")
+
+    monkeypatch.setattr(clickhouse_client.sql_client, "execute_sql", _raise)
+
+    sql = LoadIdScopedClickHouseMergeJob.gen_merge_sql([table], clickhouse_client.sql_client)
+
+    root_table_name, staging_table_name = clickhouse_client.sql_client.get_qualified_table_names(
+        "probe_fails_table"
+    )
+    (root_delete,) = _statements(sql, f"DELETE FROM {root_table_name} WHERE")
+    assert " AND `col1` IN" not in root_delete
+    (staging_delete,) = _statements(sql, f"DELETE FROM {staging_table_name} WHERE")
+    assert staging_delete.endswith(f"`_dlt_load_id` = '{scoped_load_id}'")
+
+
+def test_load_id_scoped_merge_unpruned_without_partition_hint(
+    clickhouse_client: ClickHouseClient,
+    scoped_load_id: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No PARTITION BY hint: no staged-values probe, statements unchanged."""
+    table = _prepare_merge_table(clickhouse_client, "plain_table", merge_key=True)
+    executed = _mock_staged_partition_values(monkeypatch, clickhouse_client, [(770,)])
+
+    sql = LoadIdScopedClickHouseMergeJob.gen_merge_sql([table], clickhouse_client.sql_client)
+
+    assert executed == []
+    _, staging_table_name = clickhouse_client.sql_client.get_qualified_table_names("plain_table")
+    (staging_delete,) = _statements(sql, f"DELETE FROM {staging_table_name} WHERE")
+    assert staging_delete.endswith(f"`_dlt_load_id` = '{scoped_load_id}'")
